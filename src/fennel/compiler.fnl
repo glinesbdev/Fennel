@@ -348,8 +348,9 @@ if opts contains the nval option."
   (when opts.tail
     (emit parent (string.format "return %s" (exprs1 exprs)) ast))
   (when opts.target
-    (let [result (exprs1 exprs)]
-      (emit parent (string.format "%s = %s" opts.target
+    (let [result (exprs1 exprs)
+          target (if (= :function (type opts.target)) (opts.target) opts.target)]
+      (emit parent (string.format "%s = %s" target
                                   (if (= result "") "nil" result)) ast)))
   (if (or opts.tail opts.target)
       ;; Prevent statements and expression from being used twice if they
@@ -564,11 +565,11 @@ which we have to do if we don't know."
         setter (if declaration "local %s = %s" "%s = %s")
         new-manglings []]
 
-    (fn getname [symbol up1]
+    (fn getname [symbol]
       "Get Lua source for symbol, and check for errors"
       (let [raw (. symbol 1)]
         (assert-compile (not (and nomulti (utils.multi-sym? raw)))
-                       (.. "unexpected multi symbol " raw) up1)
+                       (.. "unexpected multi symbol " raw) ast)
         (if declaration
             (declare-local symbol {:var isvar} scope symbol new-manglings)
             (let [parts (or (utils.multi-sym? raw) [raw])
@@ -590,14 +591,26 @@ which we have to do if we don't know."
                   (table.insert allowed-globals raw)))
               (. (symbol-to-expression symbol scope) 1)))))
 
-    (fn compile-top-target [lvalues]
+    (fn memoize [f] ; won't work with multivalued functions
+      (var (ran? result) false)
+      (fn [...]
+        (if ran?
+            result
+            (do (set result (f ...))
+                (set ran? true)
+                result))))
+
+    (fn compile-top-target [thunks]
       "Compile the outer most form. We can generate better Lua in this case."
       ;; Calculate initial rvalue
-      (let [inits (utils.map lvalues #(if (. scope.manglings $) $ "nil"))
+      (var (plen plast) (values (# parent) (. parent (# parent))))
+      (let [thunks (utils.map thunks memoize)
+            lvalue-thunk #(table.concat (utils.map thunks #($)) ", ")
+            ret (compile1 from scope parent {:target lvalue-thunk})
+            lvalues (utils.map thunks #($))
+            inits (utils.map lvalues #(if (. scope.manglings $) $ "nil"))
             init (table.concat inits ", ")
             lvalue (table.concat lvalues ", ")]
-        (var (plen plast) (values (# parent) (. parent (# parent))))
-        (local ret (compile1 from scope parent {:target lvalue}))
         (when declaration
           ;; A single leaf emitted at the end of the parent chunk means a
           ;; simple assignment a = x was emitted, and we can just splice
@@ -620,11 +633,11 @@ which we have to do if we don't know."
     (fn destructure1 [left rightexprs up1 top]
       "Recursive auxiliary function"
       (if (and (utils.sym? left) (not= (. left 1) "nil"))
-          (let [lname (getname left up1)]
-            (check-binding-valid left scope left)
-            (if top
-                (compile-top-target [lname])
-                (emit parent (setter:format lname (exprs1 rightexprs)) left)))
+          (do (check-binding-valid left scope left)
+              (if top
+                  (compile-top-target [(partial getname left)])
+                  (emit parent (setter:format (getname left)
+                                              (exprs1 rightexprs)) left)))
           (utils.table? left) ; table destructuring
           (let [s (gensym scope)]
             (var right (if top
@@ -656,18 +669,17 @@ which we have to do if we don't know."
                                               :expression)]
                       (destructure1 v [subexpr] left))))))
           (utils.list? left) ;; values destructuring
-          (let [(left-names tables) (values [] [])]
+          (let [(left-thunks tables) (values [] [])]
             (each [i name (ipairs left)]
-              (var symname nil)
               (if (utils.sym? name) ; binding directly to a name
-                  (set symname (getname name up1))
-                  (do ; further destructuring of tables inside values
-                    (set symname (gensym scope))
-                    (tset tables i [name (utils.expr symname "sym")])))
-              (table.insert left-names symname))
+                  (table.insert left-thunks (partial getname name))
+                  ;; further destructuring of tables inside values
+                  (let [symname (gensym scope)]
+                    (table.insert left-thunks #symname)
+                    (tset tables i [name (utils.expr symname "sym")]))))
             (if top
-                (compile-top-target left-names)
-                (let [lvalue (table.concat left-names ", ")
+                (compile-top-target left-thunks)
+                (let [lvalue (table.concat (utils.map left-thunks #($)) ", ")
                       setting (setter:format lvalue (exprs1 rightexprs))]
                   (emit parent setting left)))
             ;; recurse if left-side tables found
